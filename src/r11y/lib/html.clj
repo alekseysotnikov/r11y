@@ -4,6 +4,7 @@
             [clojure.string :as str])
   (:import (java.net URI)
            (java.io ByteArrayInputStream)
+           (java.nio.charset Charset)
            [org.jsoup Jsoup]
            [org.jsoup.nodes Document Element Node TextNode]
            [java.util.regex Pattern]))
@@ -11,10 +12,7 @@
 (def PRESERVE_START_TOKEN "__PRESERVE_ae0d3c51_START__")
 (def PRESERVE_END_TOKEN "__PRESERVE_ae0d3c51_END__")
 
-(defn- parse-html-bytes
-  "Parse HTML from bytes, letting JSoup detect the charset"
-  [^bytes body-bytes base-url]
-  (Jsoup/parse (ByteArrayInputStream. body-bytes) nil (or base-url "")))
+(declare parse-html-bytes)
 
 (defn- bytes->utf8
   "Convert bytes to UTF-8 string"
@@ -663,10 +661,13 @@
 ;; Main API
 (defn extract-content
   "Extract content from HTML. Input can be a String or byte array.
-   When passing bytes, JSoup will auto-detect the charset."
-  [html-input & {:keys [format link-density-threshold base-url with-metadata] :or {format :html link-density-threshold default-link-density-threshold with-metadata false}}]
+   When passing bytes, charset is detected from `:content-type` (if provided),
+   then a BOM, then a `<meta charset>` tag in the head; bytes are decoded to a
+   String and parsed. When no charset is detected, JSoup's auto-detection is
+   used as a fallback."
+  [html-input & {:keys [format link-density-threshold base-url with-metadata content-type] :or {format :html link-density-threshold default-link-density-threshold with-metadata false}}]
   (let [doc (if (bytes? html-input)
-              (parse-html-bytes html-input base-url)
+              (parse-html-bytes html-input base-url content-type)
               (Jsoup/parse ^String html-input))
         metadata (when with-metadata (extract-metadata doc base-url))
         frontmatter (when with-metadata (metadata-to-frontmatter metadata))
@@ -807,6 +808,83 @@
           (re-find #"(?m)^[-*+]\s+\S" s)
           (re-find #"(?m)^\d+\.\s+\S" s)))))
 
+(def ^:private meta-charset-pattern
+  "Match <meta charset=\"...\"> (order-tolerant, case-insensitive)."
+  (Pattern/compile "(?is)<meta[^>]+charset\\s*=\\s*[\"']?([\\w-]+)"))
+
+(def ^:private xml-encoding-pattern
+  "Match <?xml ... encoding=\"...\"?>"
+  (Pattern/compile "(?is)<\\?xml[^>]+encoding\\s*=\\s*[\"']?([\\w-]+)"))
+
+(def ^:private charset-from-ct-pattern
+  (Pattern/compile "(?i)charset\\s*=\\s*[\"']?([\\w-]+)"))
+
+(defn- valid-charset-name
+  "Return charset name string if `cs-name` is a known charset, else nil."
+  [^String cs-name]
+  (when (and cs-name (pos? (count cs-name)))
+    (try (.name (Charset/forName cs-name))
+         (catch Exception _ nil))))
+
+(defn- charset-from-content-type
+  "Extract charset from Content-Type header value (e.g. \"text/html; charset=Windows-1251\")."
+  [content-type]
+  (when (and content-type (pos? (count content-type)))
+    (let [m (.matcher charset-from-ct-pattern ^String content-type)]
+      (when (.find m)
+        (valid-charset-name (.group m 1))))))
+
+(defn- charset-from-bom
+  "Detect charset from leading bytes (UTF-8/UTF-16 BOM). Returns charset name or nil."
+  [^bytes body-bytes]
+  (when (and body-bytes (>= (alength body-bytes) 2))
+    (let [b0 (bit-and (aget body-bytes 0) 0xFF)
+          b1 (bit-and (aget body-bytes 1) 0xFF)]
+      (cond
+        (and (= b0 0xEF) (>= (alength body-bytes) 3)
+             (= (bit-and (aget body-bytes 2) 0xFF) 0xBF)) "UTF-8"
+        (and (= b0 0xFE) (= b1 0xFF)) "UTF-16BE"
+        (and (= b0 0xFF) (= b1 0xFE)) "UTF-16LE"
+        :else nil))))
+
+(defn- charset-from-meta
+  "Scan first 2 KB of HTML for <meta charset=...> or <?xml encoding=...>.
+   Decodes head bytes as ISO-8859-1 to make regex match byte-faithful."
+  [^bytes body-bytes]
+  (when (and body-bytes (pos? (alength body-bytes)))
+    (let [head-len (min (alength body-bytes) 2048)
+          head-str (String. body-bytes 0 head-len "ISO-8859-1")]
+      (or
+       (when-let [m (re-find meta-charset-pattern head-str)]
+         (valid-charset-name (second m)))
+       (when-let [m (re-find xml-encoding-pattern head-str)]
+         (valid-charset-name (second m)))))))
+
+(defn- detect-charset
+  "Detect charset from Content-Type, BOM, or HTML meta tag. Returns a validated
+   java.nio.charset.Charset or nil. Cascade priority: CT > BOM > meta tag."
+  [^bytes body-bytes content-type]
+  (or
+   (when-let [name (charset-from-content-type content-type)]
+     (Charset/forName name))
+   (when-let [name (charset-from-bom body-bytes)]
+     (Charset/forName name))
+   (when-let [name (charset-from-meta body-bytes)]
+     (Charset/forName name))))
+
+(defn- parse-html-bytes
+  "Parse HTML from bytes, letting JSoup detect the charset.
+   When `content-type` is supplied, charset is detected from the header,
+   then BOM, then <meta charset> in the head; bytes are decoded to a String
+   with that charset and parsed as a String. This bypasses JSoup's
+   InputStream-based charset detection (which is incomplete on GraalVM
+   native images for some encodings)."
+  ([^bytes body-bytes base-url] (parse-html-bytes body-bytes base-url nil))
+  ([^bytes body-bytes base-url content-type]
+   (if-let [cs (detect-charset body-bytes content-type)]
+     (Jsoup/parse ^String (String. ^bytes body-bytes ^Charset cs) (or base-url ""))
+     (Jsoup/parse (ByteArrayInputStream. body-bytes) nil (or base-url "")))))
+
 (def ^:const default-fetch-headers
   "Default request identity for content extraction. The User-Agent
    and Sec-Fetch-* headers make servers serve the same content they
@@ -859,7 +937,8 @@
         metadata (when (and with-metadata original-body
                             (not (looks-like-markdown? original-body)))
                    (let [doc (if (bytes? original-body)
-                               (parse-html-bytes original-body url)
+                               (parse-html-bytes original-body url
+                                                 (get-in original-response [:headers :content-type]))
                                (Jsoup/parse ^String original-body))]
                      (extract-metadata doc url)))
         ;; Step 3: Fetch normalized URL for extraction if URLs differ
@@ -884,6 +963,7 @@
                            (if metadata
                              (let [result (extract-content extraction-body
                                                            :base-url normalized-url
+                                                           :content-type header-content-type
                                                            :format format
                                                            :link-density-threshold link-density-threshold
                                                            :with-metadata false)]
@@ -892,6 +972,7 @@
                                       :metadata metadata))
                              (extract-content extraction-body
                                               :base-url normalized-url
+                                              :content-type header-content-type
                                               :format format
                                               :link-density-threshold link-density-threshold
                                               :with-metadata with-metadata)))]

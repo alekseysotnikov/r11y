@@ -2,7 +2,8 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [r11y.lib.html :as html])
-  (:import [org.jsoup Jsoup]))
+  (:import [org.jsoup Jsoup]
+           [java.nio.charset Charset]))
 
 (deftest test-link-and-image-deduplication
   (testing "Links and images are deduplicated by URL"
@@ -920,3 +921,95 @@
       (is (re-find #"(?m)^\s*[-*]\s+Apple" (:markdown result)))
       (is (re-find #"(?m)^\s*[-*]\s+Banana" (:markdown result)))
       (is (re-find #"(?m)^\s*[-*]\s+Cherry" (:markdown result))))))
+
+;; --- Charset detection ---
+
+(defn- call-charset-from-content-type [s]
+  (#'html/charset-from-content-type s))
+
+(defn- call-charset-from-bom [^bytes b]
+  (#'html/charset-from-bom b))
+
+(defn- call-charset-from-meta [^bytes b]
+  (#'html/charset-from-meta b))
+
+(defn- call-detect-charset [^bytes b ct]
+  (#'html/detect-charset b ct))
+
+(deftest test-charset-from-content-type
+  (testing "extracts charset from Content-Type header"
+    (is (= "UTF-8" (call-charset-from-content-type "text/html; charset=UTF-8")))
+    (is (= "UTF-8" (call-charset-from-content-type "text/html;charset=utf-8"))
+        "no space after semicolon")
+    (is (= "UTF-8" (call-charset-from-content-type "text/html; charset = utf-8"))
+        "spaces around equals")
+    (is (= "windows-1251" (call-charset-from-content-type "text/html; charset=Windows-1251"))))
+  (testing "returns nil when no charset or unknown charset"
+    (is (nil? (call-charset-from-content-type "text/html")))
+    (is (nil? (call-charset-from-content-type "text/html; charset=bogus-9999")))
+    (is (nil? (call-charset-from-content-type nil)))
+    (is (nil? (call-charset-from-content-type "")))))
+
+(deftest test-charset-from-bom
+  (testing "detects UTF-8 BOM"
+    (is (= "UTF-8" (call-charset-from-bom (byte-array [(unchecked-byte 0xEF) (unchecked-byte 0xBB) (unchecked-byte 0xBF) (byte 0x41)])))))
+  (testing "detects UTF-16BE BOM"
+    (is (= "UTF-16BE" (call-charset-from-bom (byte-array [(unchecked-byte 0xFE) (unchecked-byte 0xFF) (byte 0x00) (byte 0x41)])))))
+  (testing "detects UTF-16LE BOM"
+    (is (= "UTF-16LE" (call-charset-from-bom (byte-array [(unchecked-byte 0xFF) (unchecked-byte 0xFE) (byte 0x41) (byte 0x00)])))))
+  (testing "no BOM returns nil"
+    (is (nil? (call-charset-from-bom (byte-array [(byte 0x3C) (byte 0x68) (byte 0x74)]))))
+    (is (nil? (call-charset-from-bom (byte-array []))))))
+
+(deftest test-charset-from-meta
+  (testing "detects charset from <meta charset=...>"
+    (let [html-bytes (.getBytes "<html><head><meta charset=\"Windows-1251\"></head></html>" "ISO-8859-1")]
+      (is (= "windows-1251" (call-charset-from-meta html-bytes))))
+    (let [html-bytes (.getBytes "<html><head><META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\"></head></html>" "ISO-8859-1")]
+      (is (= "UTF-8" (call-charset-from-meta html-bytes))
+          "charset in content= attribute is detected")))
+  (testing "detects charset from <?xml encoding=...>"
+    (let [html-bytes (.getBytes "<?xml version=\"1.0\" encoding=\"UTF-8\"?><html></html>" "ISO-8859-1")]
+      (is (= "UTF-8" (call-charset-from-meta html-bytes)))))
+  (testing "returns nil for HTML with no charset hint"
+    (let [html-bytes (.getBytes "<html><head><title>No charset</title></head></html>" "ISO-8859-1")]
+      (is (nil? (call-charset-from-meta html-bytes))))))
+
+(deftest test-detect-charset-cascade
+  (testing "CT wins over meta tag"
+    (let [html-bytes (.getBytes "<html><head><meta charset=\"UTF-8\"></head></html>" "ISO-8859-1")]
+      (is (= "windows-1251" (.name (call-detect-charset html-bytes "text/html; charset=Windows-1251"))))))
+  (testing "BOM wins over meta tag"
+    (let [b (byte-array [(unchecked-byte 0xEF) (unchecked-byte 0xBB) (unchecked-byte 0xBF) (byte 0x3C)])]
+      (is (= "UTF-8" (.name (call-detect-charset b nil))))))
+  (testing "falls back to meta tag when no CT and no BOM"
+    (let [html-bytes (.getBytes "<html><head><meta charset=\"Windows-1251\"></head></html>" "ISO-8859-1")]
+      (is (= "windows-1251" (.name (call-detect-charset html-bytes nil))))))
+  (testing "returns nil when nothing matches"
+    (let [html-bytes (.getBytes "<html><head></head></html>" "ISO-8859-1")]
+      (is (nil? (call-detect-charset html-bytes nil))))))
+
+(deftest test-extract-content-windows-1251
+  (testing "bytes encoded in Windows-1251 are decoded correctly via content-type"
+    (let [html-str "<html><head><title>Тест</title></head><body><p>Привет, мир!</p></body></html>"
+          bytes-1251 (.getBytes html-str "Windows-1251")]
+      ;; Sanity: bytes are NOT valid UTF-8 for the Cyrillic part
+      (is (not= html-str (String. bytes-1251 "UTF-8"))
+          "Bytes should be Windows-1251 encoded, not UTF-8")
+      (let [result (html/extract-content bytes-1251
+                                         :base-url "https://example.com"
+                                         :content-type "text/html; charset=Windows-1251")
+            md (:markdown result)]
+        (is (str/includes? md "Привет, мир!") "Cyrillic should be preserved"))))
+  (testing "bytes with <meta charset=Windows-1251> and no CT are decoded via meta"
+    (let [html-str "<html><head><meta charset=\"Windows-1251\"></head><body><p>Привет</p></body></html>"
+          bytes-1251 (.getBytes html-str "Windows-1251")]
+      (let [result (html/extract-content bytes-1251 :base-url "https://example.com")
+            md (:markdown result)]
+        (is (str/includes? md "Привет") "Cyrillic should be preserved via meta tag detection"))))
+  (testing "regression: pure UTF-8 still works (no CT, no meta)"
+    (let [html-str "<html><body><p>Hello, мир</p></body></html>"
+          bytes-utf8 (.getBytes html-str "UTF-8")]
+      (let [result (html/extract-content bytes-utf8 :base-url "https://example.com")
+            md (:markdown result)]
+        (is (str/includes? md "Hello, мир") "UTF-8 should still work without charset hints")))))

@@ -32,6 +32,7 @@ $NATIVE_IMAGE \
   -H:Name=r11y \
   -Dr11y.version="$VERSION" \
   -H:+ReportExceptionStackTraces \
+  -H:+AddAllCharsets \
   --features=clj_easy.graal_build_time.InitClojureClasses \
   --no-fallback \
   --report-unsupported-elements-at-runtime \
